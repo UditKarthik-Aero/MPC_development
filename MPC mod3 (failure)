@@ -1,0 +1,1026 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from collections import deque
+import pickle
+import os
+import time
+import traceback
+
+# =========================================================
+# 1. CONSTANTS
+# =========================================================
+G = 9.80665
+
+F_MAX = 2_500_000.0
+
+DRY_MASS = 35600.0
+FUEL_MASS = 40000.0
+
+ISP_VAC = 380.0
+ISP_SEA = 330.0
+
+HEIGHT = 50.0
+RADIUS = 1.8
+
+AREA_SIDE = HEIGHT * RADIUS * 2
+AREA_FINS = 6.0
+
+# =========================================================
+# 2. ENVIRONMENT
+# =========================================================
+WIND_GUST_STRENGTH = 15.0
+SENSOR_NOISE_STD = 0.5
+
+# =========================================================
+# 3. OPTIMIZED SETTINGS
+# =========================================================
+MAX_EPISODES = 100000
+
+HORIZON = 8
+
+NUM_TRAJECTORIES = 14
+
+DT = 0.05
+
+DT_PREDICT = 0.18
+
+TEMPERATURE = 4500
+
+MAX_STEPS = 4500
+
+# =========================================================
+# 4. STRICT SUCCESS CRITERIA
+# =========================================================
+SAFE_SPEED = 1.0
+
+SAFE_OFFSET = 2.0
+
+SAFE_TILT = 10.0
+
+# =========================================================
+# 5. LEARNING SETTINGS
+# =========================================================
+INITIAL_EXPLORATION = 0.08
+
+MIN_EXPLORATION = 0.008
+
+EXPLORATION_DECAY = 0.997
+
+# =========================================================
+# 6. FILES
+# =========================================================
+CHECKPOINT_FILE = "rocket_checkpoint.pkl"
+
+SUCCESS_FILE = "successful_policy.pkl"
+
+# =========================================================
+# 7. MEMORY
+# =========================================================
+replay_buffer = deque(maxlen=400)
+
+# =========================================================
+# 8. INERTIA
+# =========================================================
+def get_inertia(mass):
+
+    return (
+        (1 / 12)
+        * mass
+        * (3 * RADIUS**2 + HEIGHT**2)
+    )
+
+# =========================================================
+# 9. CHECKPOINT SAVE
+# =========================================================
+def save_checkpoint(data):
+
+    with open(CHECKPOINT_FILE, "wb") as f:
+
+        pickle.dump(data, f)
+
+# =========================================================
+# 10. CHECKPOINT LOAD
+# =========================================================
+def load_checkpoint():
+
+    if os.path.exists(CHECKPOINT_FILE):
+
+        with open(CHECKPOINT_FILE, "rb") as f:
+
+            return pickle.load(f)
+
+    return None
+
+# =========================================================
+# 11. SAFE NORMALIZATION
+# =========================================================
+def safe_normalize(v):
+
+    norm = np.linalg.norm(v)
+
+    if norm < 1e-8:
+
+        return np.array([0.0, 0.0, 1.0])
+
+    return v / norm
+
+# =========================================================
+# 12. SAFE EXP
+# =========================================================
+def safe_exp(x):
+
+    x = np.clip(x, -50, 50)
+
+    return np.exp(x)
+
+# =========================================================
+# 13. MPPI CONTROLLER
+# =========================================================
+class MPPIController:
+
+    def __init__(self):
+
+        hover = (
+            (DRY_MASS + FUEL_MASS)
+            * G
+        )
+
+        self.control_sequence = [
+
+            (
+                hover,
+                np.array([0.0, 0.0, 1.0])
+            )
+
+            for _ in range(HORIZON)
+        ]
+
+        self.ignited = False
+
+    # =====================================================
+    # ROLLOUT
+    # =====================================================
+    def rollout(
+        self,
+        pos,
+        vel,
+        mass,
+        sequence
+    ):
+
+        sim_pos = pos.copy()
+
+        sim_vel = vel.copy()
+
+        total_cost = 0
+
+        for thrust_mag, thrust_dir in sequence:
+
+            thrust_vec = (
+                thrust_dir
+                * thrust_mag
+            )
+
+            accel = (
+
+                thrust_vec
+
+                + np.array([0, 0, -G * mass])
+
+            ) / mass
+
+            sim_vel += (
+                accel
+                * DT_PREDICT
+            )
+
+            sim_pos += (
+                sim_vel
+                * DT_PREDICT
+            )
+
+            speed = np.linalg.norm(sim_vel)
+
+            offset = np.linalg.norm(
+                sim_pos[:2]
+            )
+
+            vertical_penalty = 0
+
+            if sim_vel[2] > 0:
+
+                vertical_penalty = (
+                    sim_vel[2]**2
+                    * 80
+                )
+
+            tilt_cost = (
+                1 - thrust_dir[2]
+            ) * 300
+
+            fuel_cost = (
+                thrust_mag
+                * 0.0000015
+            )
+
+            total_cost += (
+
+                speed**2
+
+                + 0.2 * offset**2
+
+                + vertical_penalty
+
+                + tilt_cost
+
+                + fuel_cost
+            )
+
+            # early catastrophic failure
+            if (
+                speed > 600
+                or offset > 10000
+                or sim_pos[2] > 9000
+            ):
+
+                total_cost += 1e8
+
+                break
+
+            if sim_pos[2] <= 0:
+                break
+
+        return total_cost
+
+    # =====================================================
+    # OPTIMIZER
+    # =====================================================
+    def optimize(
+        self,
+        pos,
+        vel,
+        mass,
+        exploration
+    ):
+
+        x, y, z = pos
+
+        vx, vy, vz = vel
+
+        max_a_z = (
+            F_MAX / mass
+        ) - G
+
+        d_brake = (
+            vz**2
+            /
+            (2 * max_a_z * 0.72)
+        )
+
+        # ignition logic
+        if not self.ignited:
+
+            if z <= d_brake + 180:
+
+                self.ignited = True
+
+            return (
+                0.0,
+                np.array([0,0,1])
+            )
+
+        trajectories = []
+
+        costs = []
+
+        # =================================================
+        # SAMPLE TRAJECTORIES
+        # =================================================
+        for _ in range(NUM_TRAJECTORIES):
+
+            candidate = []
+
+            for _ in range(HORIZON):
+
+                target_dir = np.array([
+
+                    -0.012 * x
+                    -0.08 * vx,
+
+                    -0.012 * y
+                    -0.08 * vy,
+
+                    1.0
+                ])
+
+                target_dir = safe_normalize(
+                    target_dir
+                )
+
+                dir_noise = np.random.normal(
+                    0,
+                    exploration,
+                    3
+                )
+
+                thrust_dir = safe_normalize(
+                    target_dir + dir_noise
+                )
+
+                hover = mass * G
+
+                thrust_mag = np.clip(
+
+                    hover
+
+                    + np.random.normal(
+                        0,
+                        exploration * hover
+                    ),
+
+                    0.80 * hover,
+
+                    1.15 * hover
+                )
+
+                thrust_mag = min(
+                    thrust_mag,
+                    F_MAX
+                )
+
+                candidate.append(
+                    (
+                        thrust_mag,
+                        thrust_dir
+                    )
+                )
+
+            cost = self.rollout(
+                pos,
+                vel,
+                mass,
+                candidate
+            )
+
+            trajectories.append(candidate)
+
+            costs.append(cost)
+
+        costs = np.array(costs)
+
+        beta = np.min(costs)
+
+        weights = safe_exp(
+            -(costs - beta)
+            / TEMPERATURE
+        )
+
+        weights /= (
+            np.sum(weights)
+            + 1e-6
+        )
+
+        new_sequence = []
+
+        for k in range(HORIZON):
+
+            mag = 0
+
+            direction = np.zeros(3)
+
+            for i in range(NUM_TRAJECTORIES):
+
+                m, d = trajectories[i][k]
+
+                mag += weights[i] * m
+
+                direction += weights[i] * d
+
+            direction = safe_normalize(
+                direction
+            )
+
+            new_sequence.append(
+                (
+                    mag,
+                    direction
+                )
+            )
+
+        self.control_sequence = new_sequence
+
+        action = self.control_sequence[0]
+
+        self.control_sequence = (
+
+            self.control_sequence[1:]
+
+            + [self.control_sequence[-1]]
+        )
+
+        return action
+
+# =========================================================
+# 14. SINGLE EPISODE
+# =========================================================
+def run_episode(exploration):
+
+    pos = np.array([
+        500.0,
+        -300.0,
+        5000.0
+    ])
+
+    vel = np.array([
+        -40.0,
+        20.0,
+        -150.0
+    ])
+
+    rocket_axis = np.array([
+        0,
+        0,
+        1.0
+    ])
+
+    omega = np.zeros(3)
+
+    mass = DRY_MASS + FUEL_MASS
+
+    controller = MPPIController()
+
+    max_tilt = 0
+
+    history = []
+
+    total_reward = 0
+
+    for step in range(MAX_STEPS):
+
+        if pos[2] <= 0:
+            break
+
+        # =================================================
+        # SENSOR NOISE
+        # =================================================
+        noisy_pos = (
+
+            pos
+
+            + np.random.normal(
+                0,
+                SENSOR_NOISE_STD,
+                3
+            )
+        )
+
+        noisy_vel = (
+
+            vel
+
+            + np.random.normal(
+                0,
+                SENSOR_NOISE_STD / 2,
+                3
+            )
+        )
+
+        # =================================================
+        # STOCHASTIC WIND
+        # =================================================
+        wind = np.array([
+
+            np.sin(step * 0.015)
+
+            * WIND_GUST_STRENGTH
+
+            * np.random.uniform(
+                0.4,
+                1.8
+            ),
+
+            np.cos(step * 0.012)
+
+            * WIND_GUST_STRENGTH
+
+            * np.random.uniform(
+                0.4,
+                1.8
+            ),
+
+            0
+        ])
+
+        relative_vel = vel - wind
+
+        # =================================================
+        # CONTROL
+        # =================================================
+        T_mag, T_dir = controller.optimize(
+            noisy_pos,
+            noisy_vel,
+            mass,
+            exploration
+        )
+
+        # =================================================
+        # ATMOSPHERE
+        # =================================================
+        rho = (
+            1.225
+            * np.exp(-max(0, pos[2]) / 8500)
+        )
+
+        q = (
+            0.5
+            * rho
+            * np.linalg.norm(relative_vel)**2
+        )
+
+        inertia = get_inertia(mass)
+
+        # =================================================
+        # ATTITUDE CONTROL
+        # =================================================
+        attitude_error = np.cross(
+            rocket_axis,
+            T_dir
+        )
+
+        control_torque = (
+
+            1_200_000
+            * attitude_error
+
+            - 600_000
+            * omega
+        )
+
+        aero_torque = (
+
+            np.cross(
+
+                rocket_axis,
+
+                -safe_normalize(
+                    relative_vel
+                )
+            )
+
+            * q
+
+            * AREA_FINS
+
+            * (HEIGHT / 2)
+
+            * 0.06
+        )
+
+        total_torque = (
+            control_torque
+            + aero_torque
+        )
+
+        alpha = (
+            total_torque
+            / inertia
+        )
+
+        omega += alpha * DT
+
+        omega *= 0.90
+
+        rocket_axis += (
+            np.cross(
+                omega,
+                rocket_axis
+            )
+            * DT
+        )
+
+        rocket_axis = safe_normalize(
+            rocket_axis
+        )
+
+        # =================================================
+        # TILT
+        # =================================================
+        tilt_deg = np.degrees(
+
+            np.arccos(
+
+                np.clip(
+                    rocket_axis[2],
+                    -1,
+                    1
+                )
+            )
+        )
+
+        max_tilt = max(
+            max_tilt,
+            tilt_deg
+        )
+
+        # catastrophic failure termination
+        if (
+            tilt_deg > 80
+            or np.linalg.norm(vel) > 600
+            or pos[2] > 9000
+        ):
+            total_reward -= 1e7
+            break
+
+        # =================================================
+        # FORCES
+        # =================================================
+        thrust_vec = (
+            rocket_axis
+            * T_mag
+        )
+
+        drag_vec = (
+
+            -relative_vel
+
+            * (
+                0.5
+                * rho
+                * np.linalg.norm(relative_vel)
+                * AREA_SIDE
+                * 0.35
+            )
+        )
+
+        accel = (
+
+            thrust_vec
+
+            + drag_vec
+
+            + np.array([0,0,-G*mass])
+
+        ) / mass
+
+        vel += accel * DT
+
+        speed_mag = np.linalg.norm(vel)
+
+        if speed_mag > 700:
+
+            vel = (
+                vel
+                / speed_mag
+                * 700
+            )
+
+        pos += vel * DT
+
+        # =================================================
+        # FUEL
+        # =================================================
+        isp = (
+
+            ISP_VAC
+
+            - (
+                ISP_VAC
+                - ISP_SEA
+            )
+
+            * np.exp(-max(0, pos[2]) / 8500)
+        )
+
+        mass -= (
+            T_mag
+            / (isp * G)
+        ) * DT
+
+        mass = max(
+            mass,
+            DRY_MASS
+        )
+
+        speed = np.linalg.norm(vel)
+
+        offset = np.linalg.norm(pos[:2])
+
+        reward = -(
+
+            speed**2
+
+            + 0.25 * offset**2
+
+            + 0.25 * tilt_deg**2
+        )
+
+        total_reward += reward
+
+        history.append(pos.copy())
+
+    # =====================================================
+    # FINAL METRICS
+    # =====================================================
+    final_speed = np.linalg.norm(vel)
+
+    final_offset = np.linalg.norm(pos[:2])
+
+    fuel_used = (
+        DRY_MASS
+        + FUEL_MASS
+        - mass
+    )
+
+    success = (
+
+        final_speed < SAFE_SPEED
+
+        and final_offset < SAFE_OFFSET
+
+        and max_tilt < SAFE_TILT
+    )
+
+    return {
+
+        "reward": total_reward,
+
+        "speed": final_speed,
+
+        "offset": final_offset,
+
+        "tilt": max_tilt,
+
+        "fuel": fuel_used,
+
+        "success": success,
+
+        "history": np.array(history)
+    }
+
+# =========================================================
+# 15. LOAD CHECKPOINT
+# =========================================================
+checkpoint = load_checkpoint()
+
+if checkpoint is not None:
+
+    print("\nCHECKPOINT FOUND")
+
+    start_episode = checkpoint["episode"]
+
+    exploration_std = checkpoint["exploration"]
+
+    best_reward = checkpoint["best_reward"]
+
+    best_result = checkpoint["best_result"]
+
+    replay_buffer = checkpoint["replay_buffer"]
+
+    print(
+        f"Resuming from episode "
+        f"{start_episode}"
+    )
+
+else:
+
+    print("\nNO CHECKPOINT FOUND")
+
+    start_episode = 0
+
+    exploration_std = INITIAL_EXPLORATION
+
+    best_reward = -np.inf
+
+    best_result = None
+
+# =========================================================
+# 16. TRAINING LOOP
+# =========================================================
+start_time = time.time()
+
+for episode in range(
+    start_episode,
+    MAX_EPISODES
+):
+
+    try:
+
+        result = run_episode(
+            exploration_std
+        )
+
+        replay_buffer.append(result)
+
+        if result["reward"] > best_reward:
+
+            best_reward = result["reward"]
+
+            best_result = result
+
+        elapsed = (
+            time.time()
+            - start_time
+        )
+
+        print("\n" + "=" * 60)
+
+        print(f"EPISODE {episode + 1}")
+
+        print("=" * 60)
+
+        print(
+            f"Reward        : "
+            f"{result['reward']:.2f}"
+        )
+
+        print(
+            f"Velocity      : "
+            f"{result['speed']:.4f} m/s"
+        )
+
+        print(
+            f"Offset        : "
+            f"{result['offset']:.4f} m"
+        )
+
+        print(
+            f"Tilt          : "
+            f"{result['tilt']:.2f} deg"
+        )
+
+        print(
+            f"Fuel Used     : "
+            f"{result['fuel']:.2f} kg"
+        )
+
+        print(
+            f"Success       : "
+            f"{result['success']}"
+        )
+
+        print(
+            f"Exploration   : "
+            f"{exploration_std:.5f}"
+        )
+
+        print(
+            f"Elapsed Time  : "
+            f"{elapsed/60:.2f} min"
+        )
+
+        # =================================================
+        # SAVE CHECKPOINT EVERY 5 EPISODES
+        # =================================================
+        if episode % 5 == 0:
+
+            checkpoint_data = {
+
+                "episode": episode + 1,
+
+                "exploration": exploration_std,
+
+                "best_reward": best_reward,
+
+                "best_result": best_result,
+
+                "replay_buffer": replay_buffer
+            }
+
+            save_checkpoint(
+                checkpoint_data
+            )
+
+            print(
+                "\nCheckpoint Saved"
+            )
+
+        # =================================================
+        # SUCCESS
+        # =================================================
+        if result["success"]:
+
+            print("\nSUCCESSFUL LANDING")
+
+            print(
+                f"Converged after "
+                f"{episode+1} episodes"
+            )
+
+            with open(
+                SUCCESS_FILE,
+                "wb"
+            ) as f:
+
+                pickle.dump(
+                    result,
+                    f
+                )
+
+            print(
+                "\nSuccessful policy saved"
+            )
+
+            break
+
+        # =================================================
+        # LEARNING
+        # =================================================
+        exploration_std *= (
+            EXPLORATION_DECAY
+        )
+
+        exploration_std = max(
+            exploration_std,
+            MIN_EXPLORATION
+        )
+
+    # =====================================================
+    # CRASH RECOVERY
+    # =====================================================
+    except Exception as e:
+
+        print("\nEPISODE CRASH DETECTED")
+
+        traceback.print_exc()
+
+        checkpoint_data = {
+
+            "episode": episode,
+
+            "exploration": exploration_std,
+
+            "best_reward": best_reward,
+
+            "best_result": best_result,
+
+            "replay_buffer": replay_buffer
+        }
+
+        save_checkpoint(
+            checkpoint_data
+        )
+
+        print(
+            "\nEmergency checkpoint saved"
+        )
+
+        print(
+            "\nRestart script to resume automatically"
+        )
+
+        break
+
+# =========================================================
+# 17. PLOT BEST TRAJECTORY
+# =========================================================
+if best_result is not None:
+
+    history = best_result["history"]
+
+    if len(history) > 0:
+
+        fig = plt.figure(
+            figsize=(10,8)
+        )
+
+        ax = fig.add_subplot(
+            111,
+            projection='3d'
+        )
+
+        ax.plot(
+            history[:,0],
+            history[:,1],
+            history[:,2],
+            lw=2
+        )
+
+        ax.scatter(
+            history[0,0],
+            history[0,1],
+            history[0,2],
+            s=100,
+            label="Start"
+        )
+
+        ax.scatter(
+            history[-1,0],
+            history[-1,1],
+            history[-1,2],
+            s=100,
+            label="End"
+        )
+
+        ax.set_xlabel("X")
+
+        ax.set_ylabel("Y")
+
+        ax.set_zlabel("Altitude")
+
+        ax.set_title(
+            "Best Trajectory"
+        )
+
+        ax.legend()
+
+        plt.show()
